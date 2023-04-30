@@ -223,5 +223,43 @@ fn main() {
     start.elapsed()
   );
   assert!(res.is_ok());
+
+  // produce a compressed SNARK
+  println!("Generating a CompressedSNARK using Spartan with IPA-PC...");
+  let (pk, vk) = CompressedSNARK::<_, _, _, _, S1, S2>::setup(&pp).unwrap();
+
+  let start = Instant::now();
+  type EE1 = nova_snark::provider::ipa_pc::EvaluationEngine<G1>;
+  type EE2 = nova_snark::provider::ipa_pc::EvaluationEngine<G2>;
+  type S1 = nova_snark::spartan::RelaxedR1CSSNARK<G1, EE1>;
+  type S2 = nova_snark::spartan::RelaxedR1CSSNARK<G2, EE2>;
+
+  let res = CompressedSNARK::<_, _, _, _, S1, S2>::prove(&pp, &pk, &recursive_snark);
+  println!(
+    "CompressedSNARK::prove: {:?}, took {:?}",
+    res.is_ok(),
+    start.elapsed()
+  );
+  assert!(res.is_ok());
+  let compressed_snark = res.unwrap();
+
+  let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+  bincode::serialize_into(&mut encoder, &compressed_snark).unwrap();
+  let compressed_snark_encoded = encoder.finish().unwrap();
+  println!(
+    "CompressedSNARK::len {:?} bytes",
+    compressed_snark_encoded.len()
+  );
+
+  // verify the compressed SNARK
+  println!("Verifying a CompressedSNARK...");
+  let start = Instant::now();
+  let res = compressed_snark.verify(&vk, i, z0_primary, z0_secondary);
+  println!(
+    "CompressedSNARK::verify: {:?}, took {:?}",
+    res.is_ok(),
+    start.elapsed()
+  );
+  assert!(res.is_ok());
   println!("=========================================================");
 }
