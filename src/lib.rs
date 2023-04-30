@@ -1,11 +1,8 @@
 //! This library implements Nova, a high-speed recursive SNARK.
 #![deny(
-  warnings,
-  unused,
   future_incompatible,
   nonstandard_style,
   rust_2018_idioms,
-  missing_docs
 )]
 #![allow(non_snake_case)]
 #![allow(clippy::type_complexity)]
@@ -186,6 +183,274 @@ where
   C1: StepCircuit<G1::Scalar>,
   C2: StepCircuit<G2::Scalar>,
 {
+  pub fn attack(
+    pp: &PublicParams<G1, G2, C1, C2>,
+    c_primary: C1,
+    c_secondary: C2,
+    z0_primary: Vec<G1::Scalar>,
+    z0_secondary: Vec<G2::Scalar>,
+    zi_minus_one_primary: Vec<G1::Scalar>,
+    zi_minus_one_secondary: Vec<G2::Scalar>,
+    i: usize
+  ) -> Self {
+
+    // Declare Default Instance / Witnesses
+    let U1_bot = RelaxedR1CSInstance::<G1>::default(&pp.ck_primary, &pp.r1cs_shape_primary);
+    let U2_bot = RelaxedR1CSInstance::<G2>::default(&pp.ck_secondary, &pp.r1cs_shape_secondary);
+  
+    let W1_bot = RelaxedR1CSWitness::<G1>::default(&pp.r1cs_shape_primary);
+    let W2_bot = RelaxedR1CSWitness::<G2>::default(&pp.r1cs_shape_secondary);
+
+    // ### (i-2) -> [Circuit 2] -> (i-1) -> [Circuit 1] -> i ###
+    // Initialize hashers
+    let mut hasher_x0 = <G1 as Group>::RO::new(
+      pp.ro_consts_primary.clone(),
+      NUM_FE_WITHOUT_IO_FOR_CRHF + 2 * pp.F_arity_secondary,
+    );
+    let mut hasher_x1 = <G2 as Group>::RO::new(
+      pp.ro_consts_secondary.clone(),
+      NUM_FE_WITHOUT_IO_FOR_CRHF + 2 * pp.F_arity_primary,
+    );
+    // Absorb pps 
+    hasher_x0.absorb(scalar_as_base::<G1>(pp.r1cs_shape_primary.get_digest()));
+    hasher_x1.absorb(scalar_as_base::<G2>(pp.r1cs_shape_secondary.get_digest()));
+    // Absorb i's
+    hasher_x0.absorb(G2::Scalar::from((i-2) as u64));
+    hasher_x1.absorb(G1::Scalar::from((i-1) as u64));
+    // Absorb z0's
+    for e in &z0_secondary {
+      hasher_x0.absorb(*e);
+    }
+    for e in &z0_primary {
+      hasher_x1.absorb(*e);
+    }
+    // Absorb trash input into circuit 2 and desired input for circuit 1
+    let trash_input_secondary = vec![G2::Scalar::zero(); pp.F_arity_secondary];
+    for e in &trash_input_secondary {
+      hasher_x0.absorb(*e);
+    }
+    for e in &zi_minus_one_primary.clone() {
+      hasher_x1.absorb(*e);
+    }
+    // Absorb default relaxed instances
+    U1_bot.absorb_in_ro(&mut hasher_x0);
+    U2_bot.absorb_in_ro(&mut hasher_x1);
+    // Squeeze hashes
+    let ui_minus_two_primary_x0 = hasher_x0.squeeze(NUM_HASH_BITS);
+    let ui_minus_two_primary_x1 = scalar_as_base::<G2>(hasher_x1.squeeze(NUM_HASH_BITS));
+    // Construct pseudoinstance to be fed into circuit 2
+    let ui_minus_two_primary = R1CSInstance::<G1> {
+      comm_W: Default::default(),
+      X: [ui_minus_two_primary_x0, ui_minus_two_primary_x1].to_vec()
+    };
+    // Construct folding hint to be fed into circuit 2
+    let (T1, (_, _)) = NIFS::prove(
+      &pp.ck_primary,
+      &pp.ro_consts_primary,
+      &pp.r1cs_shape_primary,
+      &U1_bot,
+      &W1_bot,
+      &ui_minus_two_primary,
+      &R1CSWitness::<G1> {W: vec![G1::Scalar::zero(); pp.num_variables().0]},
+    ).unwrap();
+    // Construct constraint system for circuit 2
+    let mut cs_i_minus_one_secondary: SatisfyingAssignment<G2> = SatisfyingAssignment::new();
+    // Construct inputs for circuit 2
+    let inputs_i_minus_one_secondary: NovaAugmentedCircuitInputs<G1> = NovaAugmentedCircuitInputs::new(
+      pp.r1cs_shape_primary.get_digest(),
+      G2::Scalar::from((i-2) as u64),
+      z0_secondary.clone(),
+      Some(trash_input_secondary),
+      Some(U1_bot.clone()),
+      Some(ui_minus_two_primary),
+      Some(Commitment::<G1>::decompress(&T1.comm_T).unwrap()),
+    );
+    let circuit_i_minus_one_secondary: NovaAugmentedCircuit<G1, C2> = NovaAugmentedCircuit::new(
+      pp.augmented_circuit_params_secondary.clone(),
+      Some(inputs_i_minus_one_secondary),
+      c_secondary.clone(),
+      pp.ro_consts_circuit_secondary.clone(),
+    );
+    let _ = circuit_i_minus_one_secondary.synthesize(&mut cs_i_minus_one_secondary);
+    // Output satisified circuit 2 instance and witness
+    let (ui_minus_one_secondary, wi_minus_one_secondary) = cs_i_minus_one_secondary
+    .r1cs_instance_and_witness(&pp.r1cs_shape_secondary, &pp.ck_secondary).unwrap();
+    // Fold prior instance with default instance to obtain output relaxed instance
+    // and witness into circuit 1
+    let (T2, (Ui_secondary, Wi_secondary)) = NIFS::prove(
+      &pp.ck_secondary,
+      &pp.ro_consts_secondary,
+      &pp.r1cs_shape_secondary,
+      &U2_bot,
+      &W2_bot,
+      &ui_minus_one_secondary,
+      &wi_minus_one_secondary,
+    ).unwrap();
+    // Construct contraint system for circuit 1
+    let mut cs_i_primary: SatisfyingAssignment<G1> = SatisfyingAssignment::new();
+    // Construct inputs for circuit 1
+    let inputs_i_primary: NovaAugmentedCircuitInputs<G2> = NovaAugmentedCircuitInputs::new(
+      pp.r1cs_shape_secondary.get_digest(),
+      G1::Scalar::from((i-1) as u64),
+      z0_primary.clone(),
+      Some(zi_minus_one_primary.clone()),
+      Some(U2_bot.clone()),
+      Some(ui_minus_one_secondary),
+      Some(Commitment::<G2>::decompress(&T2.comm_T).unwrap()),
+    );
+    let circuit_primary: NovaAugmentedCircuit<G2, C1> = NovaAugmentedCircuit::new(
+      pp.augmented_circuit_params_primary.clone(),
+      Some(inputs_i_primary),
+      c_primary.clone(),
+      pp.ro_consts_circuit_primary.clone(),
+    );
+    let _ = circuit_primary.synthesize(&mut cs_i_primary);
+    
+    // Output final attack R1CS instance and witness
+    let (ui_primary, wi_primary) = cs_i_primary
+    .r1cs_instance_and_witness(&pp.r1cs_shape_primary, &pp.ck_primary).unwrap();
+  
+    // Sanity check attack instance-witness pairs
+    //let res = pp.r1cs_shape_secondary.is_sat_relaxed(&pp.ck_secondary, &Ui_secondary, &Wi_secondary);
+    //assert!(res.is_ok());
+    //let res = pp.r1cs_shape_primary.is_sat(&pp.ck_primary, &ui_primary, &wi_primary);
+    //assert!(res.is_ok());
+
+    // #######################
+    // ### Symmetric Attack
+    // #######################
+
+    // ### (i-2) -> [Circuit 1] -> (i-1) -> [Circuit 2] -> i ###
+    // Initialize hashers
+    let mut hasher_x0 = <G2 as Group>::RO::new(
+      pp.ro_consts_secondary.clone(),
+      NUM_FE_WITHOUT_IO_FOR_CRHF + 2 * pp.F_arity_primary,
+    );
+    let mut hasher_x1 = <G1 as Group>::RO::new(
+      pp.ro_consts_primary.clone(),
+      NUM_FE_WITHOUT_IO_FOR_CRHF + 2 * pp.F_arity_secondary,
+    );
+    // Absorb pps
+    hasher_x0.absorb(scalar_as_base::<G2>(pp.r1cs_shape_secondary.get_digest()));
+    hasher_x1.absorb(scalar_as_base::<G1>(pp.r1cs_shape_primary.get_digest()));
+    // Absorb i's
+    hasher_x0.absorb(G1::Scalar::from((i-2) as u64));
+    hasher_x1.absorb(G2::Scalar::from((i-1) as u64));
+    // Absorb z0's
+    for e in &z0_primary {
+      hasher_x0.absorb(*e);
+    }
+    for e in &z0_secondary {
+      hasher_x1.absorb(*e);
+    }
+    // Absorb trash input into circuit 1 and desired input for circuit 2
+    let trash_input_primary = vec![G1::Scalar::zero(); pp.F_arity_primary];
+    for e in &trash_input_primary {
+      hasher_x0.absorb(*e);
+    }
+    for e in &zi_minus_one_secondary.clone() {
+      hasher_x1.absorb(*e);
+    }
+    // Absorb default relaxed instances
+    U2_bot.absorb_in_ro(&mut hasher_x0);
+    U1_bot.absorb_in_ro(&mut hasher_x1);
+    // Squeeze hashes
+    let ui_minus_two_secondary_x0 = hasher_x0.squeeze(NUM_HASH_BITS);
+    let ui_minus_two_secondary_x1 = scalar_as_base::<G1>(hasher_x1.squeeze(NUM_HASH_BITS));
+    // Construct pseudoinstance to be fed into circuit 1
+    let ui_minus_two_secondary = R1CSInstance::<G2> {
+      comm_W: Default::default(),
+      X: [ui_minus_two_secondary_x0, ui_minus_two_secondary_x1].to_vec()
+    };
+    // Construct folding hint to be fed into circuit 1
+    let (T1, (_, _)) = NIFS::prove(
+      &pp.ck_secondary,
+      &pp.ro_consts_secondary,
+      &pp.r1cs_shape_secondary,
+      &U2_bot,
+      &W2_bot,
+      &ui_minus_two_secondary,
+      &R1CSWitness::<G2> {W: vec![G2::Scalar::zero(); pp.num_variables().1]},
+    ).unwrap();
+    // Construct constraint system for circuit 1
+    let mut cs_i_minus_one_primary: SatisfyingAssignment<G1> = SatisfyingAssignment::new();
+    // Construct inputs for circuit 1
+    let inputs_i_minus_one_primary: NovaAugmentedCircuitInputs<G2> = NovaAugmentedCircuitInputs::new(
+      pp.r1cs_shape_secondary.get_digest(),
+      G1::Scalar::from((i-2) as u64),
+      z0_primary.clone(),
+      Some(trash_input_primary),
+      Some(U2_bot.clone()),
+      Some(ui_minus_two_secondary),
+      Some(Commitment::<G2>::decompress(&T1.comm_T).unwrap()),
+    );
+    let circuit_i_minus_one_primary: NovaAugmentedCircuit<G2, C1> = NovaAugmentedCircuit::new(
+      pp.augmented_circuit_params_primary.clone(),
+      Some(inputs_i_minus_one_primary),
+      c_primary.clone(),
+      pp.ro_consts_circuit_primary.clone(),
+    );
+    let _ = circuit_i_minus_one_primary.synthesize(&mut cs_i_minus_one_primary);
+    // Output satisified circuit 1 instance and witness
+    let (ui_minus_one_primary, wi_minus_one_primary) = cs_i_minus_one_primary
+    .r1cs_instance_and_witness(&pp.r1cs_shape_primary, &pp.ck_primary).unwrap();
+    // Fold prior instance with default instance to obtain output relaxed instance
+    // and witness into circuit 2
+    let (T2, (Ui_primary, Wi_primary)) = NIFS::prove(
+      &pp.ck_primary,
+      &pp.ro_consts_primary,
+      &pp.r1cs_shape_primary,
+      &U1_bot,
+      &W1_bot,
+      &ui_minus_one_primary,
+      &wi_minus_one_primary,
+    ).unwrap();
+    // Construct contraint system for circuit 2
+    let mut cs_i_secondary: SatisfyingAssignment<G2> = SatisfyingAssignment::new();
+    // Construct inputs for circuit 2
+    let inputs_i_secondary: NovaAugmentedCircuitInputs<G1> = NovaAugmentedCircuitInputs::new(
+      pp.r1cs_shape_primary.get_digest(),
+      G2::Scalar::from((i-1) as u64),
+      z0_secondary.clone(),
+      Some(zi_minus_one_secondary.clone()),
+      Some(U1_bot.clone()),
+      Some(ui_minus_one_primary),
+      Some(Commitment::<G1>::decompress(&T2.comm_T).unwrap()),
+    );
+    let circuit_secondary: NovaAugmentedCircuit<G1, C2> = NovaAugmentedCircuit::new(
+      pp.augmented_circuit_params_secondary.clone(),
+      Some(inputs_i_secondary),
+      c_secondary.clone(),
+      pp.ro_consts_circuit_secondary.clone(),
+    );
+    let _ = circuit_secondary.synthesize(&mut cs_i_secondary);
+    
+    // Output final attack R1CS instance and witness
+    let (ui_secondary, wi_secondary) = cs_i_secondary
+    .r1cs_instance_and_witness(&pp.r1cs_shape_secondary, &pp.ck_secondary).unwrap();
+  
+    // Sanity check attack instance-witness pairs
+    //let res = pp.r1cs_shape_primary.is_sat_relaxed(&pp.ck_primary, &Ui_primary, &Wi_primary);
+    //assert!(res.is_ok());
+    //let res = pp.r1cs_shape_secondary.is_sat(&pp.ck_secondary, &ui_secondary, &wi_secondary);
+    //assert!(res.is_ok());
+
+    Self {
+      r_W_primary: Wi_primary,
+      r_U_primary: Ui_primary,
+      l_w_primary: wi_primary,
+      l_u_primary: ui_primary,
+      r_W_secondary: Wi_secondary,
+      r_U_secondary: Ui_secondary,
+      l_w_secondary: wi_secondary,
+      l_u_secondary: ui_secondary,
+      i: i,
+      zi_primary: c_primary.output(&zi_minus_one_primary),
+      zi_secondary: c_secondary.output(&zi_minus_one_secondary),
+      _p_c1: Default::default(),
+      _p_c2: Default::default(),
+    }
+  }
   /// Create a new `RecursiveSNARK` (or updates the provided `RecursiveSNARK`)
   /// by executing a step of the incremental computation
   pub fn prove_step(
