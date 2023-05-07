@@ -201,7 +201,9 @@ fn main() {
   let zi_minus_one_primary = vec![<G1 as Group>::Scalar::zero();circuit_primary.arity()];
   let zi_minus_one_secondary = vec![<G2 as Group>::Scalar::zero();circuit_secondary.arity()];
 
-  println!("Generating fake proof of {} IVC Steps == {} iterations of Minroot...", i, (i as u128) * (num_iters_per_step as u128));
+  println!("Each IVC Step Performs {num_iters_per_step} iterations of Minroot.");
+  println!("Generating fake proof of {i} IVC Steps.");
+  println!("In total, faking {} Minroot iterations.", (i as u128) * (num_iters_per_step as u128));
   let start = Instant::now();
   let recursive_snark = RecursiveSNARK::<G1, G2, C1, C2>::attack(
     &pp,
